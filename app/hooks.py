@@ -1,0 +1,389 @@
+"""Legacy request hooks. Bound in create_app via register_hooks()."""
+from __future__ import annotations
+import os, time, logging, secrets
+from flask import request
+from werkzeug.exceptions import RequestEntityTooLarge
+
+# Internal-detail signatures that must never reach the user.  Flask messages
+# are sanitised centrally (see ``_stamp_actor_on_crud``) so a single legacy
+# route cannot leak SQL, parameter bindings or driver URLs into the UI.
+_ERROR_LEAK_SIGNATURES = (
+    "sqlite3.integrityerror",
+    "sqlalchemy.exc",
+    "sqlalchemy",
+    "integrityerror",
+    "operationalerror",
+    "programmingerror",
+    "statementerror",
+    " [sql: ",
+    "sqlalche.me",
+    "unique constraint failed",
+    "foreign key constraint failed",
+    "no such table",
+    "(background on this error",
+    "traceback (most recent call last)",
+    " [parameters:",
+    "database is locked",
+    "not null constraint failed",
+    "check constraint failed",
+)
+
+
+def _safe_flash_text(text):
+    """Replace an exception/SQL leak with a clean, actionable message."""
+    raw = str(text or "")
+    lowered = raw.lower()
+    if any(sig in lowered for sig in _ERROR_LEAK_SIGNATURES):
+        return (
+            "The operation could not be completed due to a data error. "
+            "No changes were saved — please retry, and contact support if "
+            "the problem persists."
+        )
+    return raw
+
+
+def register_hooks(app):
+    from flask import jsonify, flash, redirect, url_for, session
+    from flask_login import current_user
+    from models import Client, Material, Service, DeliveryPerson, Settings
+    from app.services.backup import _start_hourly_backup_worker, _start_reconcile_worker
+    from app.services.terms import get_active_terms
+    from app.services.permissions import _user_can
+    from app.services.constants import (
+        _AUTO_BACKUP_ENABLED,
+        _ENABLE_BACKGROUND_WORKERS,
+        BLUEPRINT_PERMISSION_PREFIXES,
+        ENDPOINT_PERMISSION_MAP,
+    )
+    @app.after_request
+    def _cache_control_headers(response):
+        # On-demand edit/view modal fragments must never be served stale —
+        # a stale fragment is the classic "click edit -> stuck overlay".
+        endpoint = request.endpoint or ''
+        short = endpoint.rsplit('.', 1)[-1] if endpoint else ''
+        if short in ('public_client_ledger', 'client_ledger_qr', 'client_ledger_qr_dialog'):
+            response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+            return response
+        if short in (
+            'direct_sale_edit_modal',
+            'booking_edit_modal',
+            'pending_bill_modals',
+            'client_modals',
+        ):
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        # HTML pages: revalidate every time.  Yard PCs share this server over
+        # LAN and code updates deploy often; without this, a cached page can
+        # run OLD page scripts against NEW routes and hang (edit modal stuck
+        # forever).  Static assets keep their own caching rules.
+        if (response.headers.get('Content-Type') or '').startswith('text/html'):
+            response.headers['Cache-Control'] = 'no-cache'
+        return response
+
+    @app.after_request
+    def allow_iframe_and_cors(response):
+        # Views that emit their own framing policy (e.g. the public QR ledger
+        # page: X-Frame-Options DENY + strict CSP) keep it. Everything else
+        # is same-origin framed unless the operator explicitly opts back in
+        # (e.g. embedding in a cross-origin dashboard, or the e2b/Arena
+        # preview) via AMS_ALLOW_IFRAME=1.
+        allow_open = os.environ.get('ALLOW_OPEN_CORS', '').lower() in ('1', 'true', 'yes')
+        allow_embed = (os.environ.get('AMS_ALLOW_IFRAME') or '').strip().lower() in ('1', 'true', 'yes')
+        view_set_frame = bool(response.headers.get('X-Frame-Options')) or 'frame-ancestors' in (
+            response.headers.get('Content-Security-Policy') or ''
+        )
+
+        if allow_open:
+            response.headers["X-Frame-Options"] = "ALLOWALL"
+            response.headers["Content-Security-Policy"] = "frame-ancestors *"
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+            response.headers["Access-Control-Allow-Credentials"] = "false"
+        elif allow_embed:
+            response.headers["X-Frame-Options"] = "ALLOWALL"
+            response.headers["Content-Security-Policy"] = "frame-ancestors *"
+        elif not view_set_frame:
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
+            response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
+
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        if (request.headers.get('X-Forwarded-Proto') or request.scheme or '').split(',')[0].strip().lower() == 'https' or request.is_secure:
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
+
+    @app.before_request
+    def _request_log_start():
+        request._log_started_at = time.time()
+
+    @app.before_request
+    def _touch_concurrent_login_session():
+        try:
+            if current_user.is_authenticated:
+                from utils.sessions import touch_login_session
+                touch_login_session(current_user)
+        except Exception:
+            pass
+
+    @app.after_request
+    def _stamp_actor_on_crud(response):
+        """Every mutating request: flash who did it + write audit_log."""
+        try:
+            method = (request.method or '').upper()
+            if method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+                return response
+            path = request.path or ''
+            if path.startswith('/static') or path.startswith('/import_export/jobs/'):
+                return response
+            endpoint = request.endpoint or ''
+            if endpoint in ('login', 'logout', 'static'):
+                return response
+            who = None
+            try:
+                if current_user and current_user.is_authenticated:
+                    who = (current_user.username or '').strip() or None
+            except Exception:
+                who = None
+            if not who:
+                return response
+            flashes = session.get('_flashes')
+            if flashes:
+                tagged = []
+                marker = f'— by {who}'
+                for cat, msg in flashes:
+                    text = _safe_flash_text(msg)
+                    if cat in ('success', 'warning', 'info', 'danger') and marker not in text:
+                        text = f'{text} {marker}'
+                    tagged.append((cat, text))
+                session['_flashes'] = tagged
+            if 200 <= int(response.status_code or 0) < 400:
+                from utils.audit import audit_log
+                audit_log(
+                    current_user,
+                    f'http.{method.lower()}.{endpoint or "unknown"}',
+                    f'path={path} status={response.status_code}',
+                )
+        except Exception:
+            pass
+        return response
+
+    @app.after_request
+    def _log_request_summary(response):
+        started = getattr(request, '_log_started_at', None)
+        elapsed_ms = ((time.time() - started) * 1000.0) if started else 0.0
+        # QR links are bearer credentials. Never write a client's raw token
+        # into application request logs.
+        logged_path = '/c/[client-ledger-token]' if request.path.startswith('/c/') else (
+            request.full_path.rstrip('?') if request.query_string else request.path
+        )
+        logging.getLogger('request').info(
+            '%s - "%s %s" %s %.1fms',
+            request.headers.get('X-Forwarded-For', request.remote_addr or '-'),
+            request.method,
+            logged_path,
+            response.status_code,
+            elapsed_ms
+        )
+        return response
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def _handle_request_too_large(_err):
+        max_mb = max(1, int((app.config.get('MAX_CONTENT_LENGTH') or 0) / (1024 * 1024)))
+        msg = f"Uploaded file is too large. Max allowed size is {max_mb} MB."
+        if request.path.startswith('/import_export/master/import/start'):
+            return jsonify({'error': msg}), 413
+        flash(msg, 'danger')
+        return redirect(request.referrer or url_for('index'))
+
+    @app.before_request
+    def _protect_against_csrf():
+        """Session-bound CSRF protection for every mutating endpoint.
+
+        The layout template attaches the session token to every mutating
+        form (and patches fetch/XHR to send the X-CSRF-Token header), so
+        the gate is transparent to the UI.  Enforcement is skipped only in
+        explicit test-mode opt-outs; the ``login`` endpoint is protected as
+        well (its template carries the token).
+        """
+        token = session.get('_csrf_token')
+        if not token:
+            token = secrets.token_urlsafe(32)
+            session['_csrf_token'] = token
+        if app.config.get('TESTING') or app.config.get('WTF_CSRF_ENABLED') is False:
+            if not app.config.get('AMS_CSRF_ALWAYS'):
+                return None
+        if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            return None
+        endpoint = request.endpoint or ''
+        if endpoint in ('static',) or endpoint.startswith('static.'):
+            return None
+        supplied = request.form.get('_csrf_token') or request.headers.get('X-CSRF-Token') or request.headers.get('X-CSRFToken')
+        if supplied and secrets.compare_digest(str(supplied), str(token)):
+            return None
+        logging.getLogger('security').warning('CSRF rejected: endpoint=%s ip=%s', endpoint, request.remote_addr)
+        return jsonify({'error': 'Invalid or expired form token. Reload the page and try again.'}), 400
+
+    @app.context_processor
+    def _inject_csrf_token():
+        token = session.get('_csrf_token')
+        if not token:
+            token = secrets.token_urlsafe(32)
+            session['_csrf_token'] = token
+        return {'csrf_token': token}
+
+    # R8/AUDIT-112: the old hook silently stripped the Secure flag from
+    # cookies whenever the *client-controllable* X-Forwarded-Proto said http.
+    # Secure cookies are now governed solely by SESSION_COOKIE_SECURE/AMS_HTTPS=1
+    # (PA serves HTTPS for free on <user>.pythonanywhere.com). To embed or
+    # access over plain HTTP on a LAN, run the site as-is (cookie Secure will
+    # simply not be set) — never by rewriting cookies based on a header.
+
+    @app.before_request
+    def _ensure_background_workers_started():
+        # A web/WSGI worker must never start scheduled work: the database copy,
+        # the reconcile pass and the backup poll all compete with the shop for
+        # the SQLite write lock, and the reconcile pass rewrites balances.  These
+        # threads belong to an explicit background process (cron -> tools/
+        # maintenance.py) or a local dev server started with
+        # AMS_ENABLE_BACKGROUND_WORKERS=1.  ``wsgi.py`` never sets that flag, so
+        # this hook is a no-op on the deployed site.
+        if not _ENABLE_BACKGROUND_WORKERS:
+            return
+        if _AUTO_BACKUP_ENABLED:
+            _start_hourly_backup_worker()
+        _start_reconcile_worker()
+        from app.services.daily_backup import ensure_worker_started
+        ensure_worker_started(app)
+
+    @app.before_request
+    def _enforce_user_permissions():
+        if not current_user.is_authenticated:
+            return None
+        if current_user.role in ('admin', 'root'):
+            return None
+        endpoint = request.endpoint or ''
+        # Core blueprints are registered before the legacy short aliases, so
+        # Flask normally reports endpoints such as ``sales.add_booking`` while
+        # the permission table historically used the short name.  Falling
+        # back to the final component keeps both route forms protected.
+        needed = ENDPOINT_PERMISSION_MAP.get(endpoint)
+        if not needed and '.' in endpoint:
+            needed = ENDPOINT_PERMISSION_MAP.get(endpoint.rsplit('.', 1)[-1])
+        # Whole-feature-pack fallback (e.g. every /accounts route).
+        if not needed and '.' in endpoint:
+            needed = BLUEPRINT_PERMISSION_PREFIXES.get(endpoint.split('.', 1)[0])
+        if not needed:
+            return None
+        # A tuple means "any of these permissions" (OR semantics).
+        if isinstance(needed, (tuple, list, set)):
+            allowed = any(_user_can(p) for p in needed)
+        else:
+            allowed = _user_can(needed)
+        if allowed:
+            return None
+        flash('Permission denied for this module.', 'danger')
+        return redirect(url_for('index'))
+
+    @app.before_request
+    def _enforce_read_only_access_mode():
+        """Read-Only accounts: block every mutating request, keep all views.
+
+        Applies only to non-admin/non-root users whose ``access_mode`` is
+        'read_only'.  Existing behaviour for everyone else is untouched.
+        Personal preference endpoints (own UI theme) stay usable.
+        """
+        from flask import request as _req
+        if _req.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            return None
+        if not current_user.is_authenticated:
+            return None
+        if current_user.role in ('admin', 'root'):
+            return None
+        mode = (getattr(current_user, 'access_mode', None) or 'read_write').strip().lower()
+        if mode != 'read_only':
+            return None
+        endpoint = _req.endpoint or ''
+        short = endpoint.rsplit('.', 1)[-1] if endpoint else ''
+        # Self-service endpoints a read-only user may still hit.
+        if short in ('api_ui_theme', 'ui_theme', 'ui_theme_preference_api'):
+            return None
+        if (_req.path or '').rstrip('/') in ('/api/ui/theme',):
+            return None
+        if (_req.path or '').startswith('/static'):
+            return None
+        # AJAX calls expect JSON, not a redirect.
+        if (_req.path or '').startswith('/api/'):
+            from flask import jsonify as _jsonify
+            return _jsonify({'success': False, 'error': 'Your account is READ-ONLY. Changes are not permitted.'}), 403
+        flash('Your account is READ-ONLY — viewing is allowed, saving/changing/deleting is blocked.', 'danger')
+        referrer = _req.referrer
+        if referrer:
+            return redirect(referrer)
+        return redirect(url_for('index'))
+
+    @app.context_processor
+    def inject_dropdown_data():
+        if current_user.is_authenticated:
+            now_ts = time.time()
+            cache_ttl = 20
+            cache_obj = getattr(app, '_dropdown_cache', None)
+            if (
+                not isinstance(cache_obj, dict)
+                or (now_ts - float(cache_obj.get('ts', 0) or 0)) > cache_ttl
+            ):
+                # This context processor feeds the shared layout, so it runs for
+                # EVERY authenticated page.  An unhandled DB error here turned
+                # every page after login into an HTTP 500 (the classic
+                # "login works, then 500" report).  Degrade to empty dropdowns
+                # instead and log the cause.
+                try:
+                    cache_obj = {
+                        'ts': now_ts,
+                        'clients': Client.query.filter_by(is_active=True).order_by(Client.name.asc()).all(),
+                        'materials': Material.query.order_by(Material.name.asc()).all(),
+                        'services': Service.query.filter_by(is_active=True).order_by(Service.name.asc()).all(),
+                        'delivery_persons': DeliveryPerson.query.filter_by(is_active=True).order_by(DeliveryPerson.name.asc()).all(),
+                        'settings': Settings.query.first(),
+                    }
+                    app._dropdown_cache = cache_obj
+                except Exception:
+                    try:
+                        from models import db as _db
+                        _db.session.rollback()
+                    except Exception:
+                        pass
+                    logging.getLogger('app').exception(
+                        "Could not load shared dropdown data; rendering the page "
+                        "with empty dropdowns."
+                    )
+                    cache_obj = {'ts': 0, 'clients': [], 'materials': [],
+                                 'services': [], 'delivery_persons': [],
+                                 'settings': None}
+            # Sidebar layout edited in Settings → Sidebar Settings.  Building
+            # it must never break a page: a broken layout falls back to the
+            # shipped defaults inside the service, and a hard error still
+            # renders an (empty) sidebar rather than a 500.
+            try:
+                from app.services.sidebar_nav import build_nav
+                sidebar_nav = build_nav(current_user)
+            except Exception:
+                logging.getLogger('app').exception(
+                    "Could not build the custom sidebar navigation; rendering an empty sidebar."
+                )
+                sidebar_nav = {'root_items': [], 'categories': []}
+            return dict(
+                clients=cache_obj.get('clients') or [],
+                materials=cache_obj.get('materials') or [],
+                services=cache_obj.get('services') or [],
+                delivery_persons=cache_obj.get('delivery_persons') or [],
+                settings=cache_obj.get('settings'),
+                # Terms & Conditions feed the Urdu print/download dialog on the
+                # bill views. Fetch them fresh so settings edits appear immediately.
+                terms=get_active_terms(),
+                user_can=_user_can,
+                sidebar_nav=sidebar_nav,
+                ui_theme_preference=session.get('ui_theme')
+            )
+        return dict(ui_theme_preference=session.get('ui_theme'))
+
