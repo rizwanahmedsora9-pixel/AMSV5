@@ -1,0 +1,11 @@
+AMS full application — local/PA test build
+Built    : 2026-11-16 (Asia/Karachi)
+Source   : local git HEAD a3107ff (not pushed anywhere; no VCS required to run)
+Contents : whitelist-only application files. Excludes: .git, instance/ (fresh DB on first boot),
+           APPLICATION_AUDIT/, .github/, CONTRIBUTING.md, docs/, scratch/, extra_docx.zip,
+           all __pycache__/bytecode/logs. Includes everything needed to run locally (see LOCAL_RUN.md).
+Verify   : unzip, pip install -r requirements-lock.txt, python main.py -> http://127.0.0.1:5000
+           default login Admin / Admin@fbm12345 (change immediately)
+SelfCheck: python tests/run_all.py (see tests/README.md; optional 10k-row durability via
+           tests/scale_seed.py + tests/scale_verify.py). Expect 12/12, 25/25, 22/22 PASS.
+Files    : 506
